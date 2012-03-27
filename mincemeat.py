@@ -38,6 +38,7 @@ import sys
 import types
 import sqlite3
 import itertools
+import json
 
 VERSION = "0.1.2"
 
@@ -202,7 +203,7 @@ class Client(Protocol):
             self.send_challenge()
 
 
-class TaskManager:
+class TaskManager(object):
     START = 0
     MAPPING = 1
     REDUCING = 2
@@ -277,7 +278,7 @@ class TaskManager:
         self.results[key] = result
 
     def get_results(self):
-        return self.results
+        return self.results.iteritems()
 
 class Server(asyncore.dispatcher, object):
     taskmanager_cls = TaskManager
@@ -368,6 +369,59 @@ class ServerChannel(Protocol):
         if self.server.collectfn:
             self.send_command('collectfn', marshal.dumps(self.server.collectfn.func_code))
         self.start_new_task()
+
+class SqliteTaskManager(TaskManager):
+    def __init__(self, datasource, server):
+        super(SqliteTaskManager, self).__init__(datasource, server)
+        self.db = server.db
+
+        # load initial schema
+        self.cursor = self.db.cursor()
+
+        schema = open(os.path.join(os.path.dirname(__file__), 'initial.sql')).read()
+        self.cursor.executescript(schema)
+
+    def save_map_results(self, mkey, results):
+        for (rkey, values) in results:
+            json_key = json.dumps(rkey)
+            for value in values:
+                self.cursor.execute("insert into map_results (key, value) values (:key, :data)", (json_key, sqlite3.Binary(pickle.dumps(value, -1))))
+
+    def get_reduce_iter(self):
+        self.db.commit()
+
+        # use a dedicated cursor for this so it doesn't get trampled by reduce saves
+        cursor = self.db.cursor()
+        map_results = cursor.execute("select key, value from map_results order by key asc")
+        groups = itertools.groupby(
+            itertools.imap(
+                lambda row: (tuple(json.loads(row[0])), pickle.loads(str(row[1]))),
+                map_results
+            ),
+            key = lambda d: d[0]
+        )
+        return itertools.imap(lambda group: (group[0], map(lambda record: record[1], group[1])), groups)
+
+    def save_reduce_results(self, rkey, result):
+        json_key = json.dumps(rkey)
+        self.cursor.execute("insert into reduce_results (key, value) values (:key, :data)", (json_key, sqlite3.Binary(pickle.dumps(result, -1))))
+
+    def get_results(self):
+        self.db.commit()
+
+        cursor = self.db.cursor()
+        reduce_results = cursor.execute("select key, value from reduce_results order by key asc")
+        return itertools.imap(
+            lambda row: (tuple(json.loads(row[0])), pickle.loads(str(row[1]))),
+            reduce_results
+        )
+
+class SqliteServer(Server):
+    taskmanager_cls = SqliteTaskManager
+
+    def __init__(self, db_path):
+        self.db = sqlite3.connect(db_path)
+        super(SqliteServer, self).__init__()
 
 def run_client():
     parser = optparse.OptionParser(usage="%prog [options]", version="%%prog %s"%VERSION)
