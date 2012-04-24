@@ -11,3 +11,9 @@ create table reduce_results(
     value text
 );
 create index if not exists reduce_results_idx on reduce_results(key asc);
+
+drop table if exists state;
+create table state(
+    current_state int
+);
+insert into state values (0);

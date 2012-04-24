@@ -209,6 +209,14 @@ class TaskManager(object):
     REDUCING = 2
     FINISHED = 3
 
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, new_state):
+        self._state = new_state
+
     def __init__(self, datasource, server):
         self.datasource = datasource
         self.server = server
@@ -371,8 +379,16 @@ class ServerChannel(Protocol):
         self.start_new_task()
 
 class SqliteTaskManager(TaskManager):
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, new_state):
+        self.cursor.execute("update state set current_state = :state", (new_state,))
+        self._state = new_state
+
     def __init__(self, datasource, server):
-        super(SqliteTaskManager, self).__init__(datasource, server)
         self.db = server.db
 
         # load initial schema
@@ -380,6 +396,8 @@ class SqliteTaskManager(TaskManager):
 
         schema = open(os.path.join(os.path.dirname(__file__), 'initial.sql')).read()
         self.cursor.executescript(schema)
+
+        super(SqliteTaskManager, self).__init__(datasource, server)
 
     def save_map_results(self, mkey, results):
         for (rkey, values) in results:
