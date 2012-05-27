@@ -39,6 +39,7 @@ import types
 import sqlite3
 import itertools
 import json
+import collections
 
 VERSION = "0.1.2"
 
@@ -183,6 +184,11 @@ class Client(Protocol):
         logging.info("Reducing %s" % str(data[0]))
         results = self.reducefn(data[0], data[1])
         self.send_command('reducedone', (data[0], results))
+
+    def call_reducefn_partial(self, command, data):
+        logging.info("Reducing partial %s" % str(data[0]))
+        results = self.reducefn(data[0][0], data[1])
+        self.send_command('reducedone', (data[0], results))
         
     def process_command(self, command, data=None):
         commands = {
@@ -191,6 +197,7 @@ class Client(Protocol):
             'reducefn': self.set_reducefn,
             'map': self.call_mapfn,
             'reduce': self.call_reducefn,
+            'partialreduce': self.call_reducefn_partial
             }
 
         if command in commands:
@@ -243,6 +250,7 @@ class TaskManager(object):
                 self.reduce_iter = self.get_reduce_iter()
                 self.working_reduces = {}
                 self.results = {}
+                return self.next_task(channel)
         if self.state == TaskManager.REDUCING:
             try:
                 reduce_item = self.reduce_iter.next()
@@ -379,6 +387,8 @@ class ServerChannel(Protocol):
         self.start_new_task()
 
 class SqliteTaskManager(TaskManager):
+    INITIAL_SQL = "initial.sql"
+
     @property
     def state(self):
         return self._state
@@ -394,7 +404,7 @@ class SqliteTaskManager(TaskManager):
         # load initial schema
         self.cursor = self.db.cursor()
 
-        schema = open(os.path.join(os.path.dirname(__file__), 'initial.sql')).read()
+        schema = open(os.path.join(os.path.dirname(__file__), self.INITIAL_SQL)).read()
         self.cursor.executescript(schema)
 
         super(SqliteTaskManager, self).__init__(datasource, server)
@@ -404,13 +414,16 @@ class SqliteTaskManager(TaskManager):
             json_key = json.dumps(rkey)
             for value in values:
                 self.cursor.execute("insert into map_results (key, value) values (:key, :data)", (json_key, sqlite3.Binary(pickle.dumps(value, -1))))
-
-    def get_reduce_iter(self):
+   
+    def _get_reduce_results(self):
         self.db.commit()
 
         # use a dedicated cursor for this so it doesn't get trampled by reduce saves
         cursor = self.db.cursor()
-        map_results = cursor.execute("select key, value from map_results order by key asc")
+        return cursor.execute("select key, value from map_results order by key asc")
+
+    def get_reduce_iter(self):
+        map_results = self._get_reduce_results()
         groups = itertools.groupby(
             itertools.imap(
                 lambda row: (tuple(json.loads(row[0])), pickle.loads(str(row[1]))),
@@ -434,12 +447,113 @@ class SqliteTaskManager(TaskManager):
             reduce_results
         )
 
+class BatchSqliteTaskManager(SqliteTaskManager):
+    INITIAL_SQL = "initial_batch.sql"
+
+    def __init__(self, datasource, server):
+        super(BatchSqliteTaskManager, self).__init__(datasource, server)
+        self.multiple_slices = set()
+        self.depth = 0
+
+    def save_map_results(self, mkey, results, depth=0):
+        for (rkey, values) in results:
+            json_key = json.dumps(rkey)
+            for value in values:
+                self.cursor.execute("insert into map_results (key, value, depth) values (:key, :data, :depth)", (json_key, sqlite3.Binary(pickle.dumps(value, -1)), depth))
+
+    def _get_reduce_results(self):
+        self.db.commit()
+
+        # use a dedicated cursor for this so it doesn't get trampled by reduce saves
+        cursor = self.db.cursor()
+        return cursor.execute("select key, value from map_results where depth = :depth order by depth, key asc", (self.depth,))
+
+    def get_reduce_iter(self):        
+        def batched_iter():
+            bare_iter = super(BatchSqliteTaskManager, self).get_reduce_iter()
+            for key, records in bare_iter:
+                hn_records = HNWrapper(records)
+                slice_count = 0
+                while True:
+                    out = list(itertools.islice(hn_records, self.server.batch_size))
+                    if out:
+                        slice_count += 1
+
+                        if hn_records.hasnext():
+                            # this slice didn't consume the whole group, so flag it
+                            self.multiple_slices.add(key)
+
+                        yield (key, slice_count, self.depth), out
+                    else:
+                        break
+
+        return batched_iter()
+
+    def reduce_done(self, data):
+        # Don't use the results if they've already been counted
+        if not data[0] in self.working_reduces:
+            return
+
+        if data[0][0] in self.multiple_slices:
+            self.save_map_results(data[0], [(data[0][0], [data[1]])], depth=self.depth+1)
+        else:
+            self.save_reduce_results(data[0][0], data[1])
+        del self.working_reduces[data[0]]
+
+    def next_task(self, channel):
+        if self.state == TaskManager.REDUCING:
+            try:
+                reduce_item = self.reduce_iter.next()
+                self.working_reduces[reduce_item[0]] = reduce_item[1]
+                return ('partialreduce', reduce_item)
+            except StopIteration:
+                if len(self.working_reduces) > 0:
+                    key = random.choice(self.working_reduces.keys())
+                    return ('partialreduce', (key, self.working_reduces[key]))
+                # we might actually be done, but we might also have to repeat the reduce round
+                if self.multiple_slices:
+                    # at least one key needs another reduction round
+                    self.depth += 1
+                    self.multiple_slices = set()
+                    self.reduce_iter = self.get_reduce_iter()
+                    return self.next_task(channel)
+                else:
+                    self.state = TaskManager.FINISHED
+        return super(BatchSqliteTaskManager, self).next_task(channel)
+
 class SqliteServer(Server):
     taskmanager_cls = SqliteTaskManager
 
     def __init__(self, db_path):
         self.db = sqlite3.connect(db_path)
         super(SqliteServer, self).__init__()
+
+class BatchSqliteServer(SqliteServer):
+    taskmanager_cls = BatchSqliteTaskManager
+
+    def __init__(self, db_path, batch_size):
+        self.batch_size = batch_size
+        super(BatchSqliteServer, self).__init__(db_path)
+
+# from http://stackoverflow.com/questions/1966591/hasnext-in-python-iterators
+class HNWrapper(object):
+    def __init__(self, it):
+        self.it = iter(it)
+        self._hasnext = None
+    def __iter__(self): return self
+    def next(self):
+        if self._hasnext:
+            result = self._thenext
+        else:
+            result = next(self.it)
+        self._hasnext = None
+        return result
+    def hasnext(self):
+        if self._hasnext is None:
+            try: self._thenext = next(self.it)
+            except StopIteration: self._hasnext = False
+            else: self._hasnext = True
+        return self._hasnext
 
 def run_client():
     parser = optparse.OptionParser(usage="%prog [options]", version="%%prog %s"%VERSION)
