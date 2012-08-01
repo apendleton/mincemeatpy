@@ -209,6 +209,13 @@ class Client(Protocol):
         if not self.auth:
             self.send_challenge()
 
+    def handle_error(self):
+        t, v, tb = sys.exc_info()
+        if t == socket.error:
+            raise t
+        else:
+            super(self, Client).handle_error()
+
 
 class TaskManager(object):
     START = 0
