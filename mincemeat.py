@@ -212,7 +212,7 @@ class Client(Protocol):
     def handle_error(self):
         t, v, tb = sys.exc_info()
         if t == socket.error:
-            raise t
+            raise v
         else:
             super(self, Client).handle_error()
 
