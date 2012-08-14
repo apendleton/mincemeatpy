@@ -214,7 +214,7 @@ class Client(Protocol):
         if t == socket.error:
             raise v
         else:
-            super(self, Client).handle_error()
+            Protocol.handle_error(self)
 
 
 class TaskManager(object):
