@@ -407,14 +407,25 @@ class SqliteTaskManager(TaskManager):
 
     def __init__(self, datasource, server):
         self.db = server.db
+        
+        if not server.resume:
+            # load initial schema
+            self.cursor = self.db.cursor()
 
-        # load initial schema
-        self.cursor = self.db.cursor()
+            schema = open(os.path.join(os.path.dirname(__file__), self.INITIAL_SQL)).read()
+            self.cursor.executescript(schema)
 
-        schema = open(os.path.join(os.path.dirname(__file__), self.INITIAL_SQL)).read()
-        self.cursor.executescript(schema)
-
-        super(SqliteTaskManager, self).__init__(datasource, server)
+            super(SqliteTaskManager, self).__init__(datasource, server)
+        else:
+            self.cursor = self.db.cursor()
+            
+            super(SqliteTaskManager, self).__init__(datasource, server)
+            
+            old_state = list(self.cursor.execute("select * from state"))
+            if old_state:
+                self._state = old_state[0][0]
+            else:
+                raise Exception("No state found; resumption failed.")
 
     def save_map_results(self, mkey, results):
         for (rkey, values) in results:
@@ -531,16 +542,17 @@ class BatchSqliteTaskManager(SqliteTaskManager):
 class SqliteServer(Server):
     taskmanager_cls = SqliteTaskManager
 
-    def __init__(self, db_path):
+    def __init__(self, db_path, resume=False):
         self.db = sqlite3.connect(db_path)
+        self.resume = resume
         super(SqliteServer, self).__init__()
 
 class BatchSqliteServer(SqliteServer):
     taskmanager_cls = BatchSqliteTaskManager
 
-    def __init__(self, db_path, batch_size):
+    def __init__(self, db_path, batch_size, resume=False):
         self.batch_size = batch_size
-        super(BatchSqliteServer, self).__init__(db_path)
+        super(BatchSqliteServer, self).__init__(db_path, resume)
 
 # from http://stackoverflow.com/questions/1966591/hasnext-in-python-iterators
 class HNWrapper(object):
